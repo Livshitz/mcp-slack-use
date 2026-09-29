@@ -75,6 +75,10 @@ export interface IngressMessage {
   /** Host-populated during onMessage; the SAME object is handed to onReplied so the host can
    *  carry per-turn state (e.g. its resolved session id) to its post-reply bookkeeping. */
   sessionId?: string;
+  /** Package-populated before the turn is piped: close the streamed reply message in flight so
+   *  anything the host posts itself (a question form, a file) lands ABOVE the rest of the reply
+   *  instead of below it. See SlackStreamer.cut(). */
+  cut?: () => Promise<void>;
 }
 
 export interface SlackIngressOptions {
@@ -117,7 +121,7 @@ export function mdToMrkdwn(md: string): string {
  * importing SlackStreamer itself.
  */
 export async function pipeAgentReply(
-  opts: { channel: string; threadTs?: string; recipientUserId?: string; useUserToken?: boolean; transform?: (t: string) => string; finalTransform?: (t: string) => Promise<string> },
+  opts: { channel: string; threadTs?: string; recipientUserId?: string; useUserToken?: boolean; transform?: (t: string) => string; finalTransform?: (t: string) => Promise<string>; handle?: { cut?: () => Promise<void> } },
   iter: AsyncIterable<AgentEvent>,
 ): Promise<string | null> {
   const streamer = new SlackStreamer({
@@ -128,6 +132,9 @@ export async function pipeAgentReply(
     transform: opts.transform ?? mdToMrkdwn,
     finalTransform: opts.finalTransform,
   });
+  // Hand the host a cut() before the first event: the iterator body only runs on the first next()
+  // below, so anything it does mid-turn can already close the message in flight.
+  if (opts.handle) opts.handle.cut = () => streamer.cut();
   try {
     for await (const ev of iter) {
       if (ev.type === 'text_delta' && typeof (ev as any).text === 'string') streamer.feed(ev as any);
@@ -193,20 +200,23 @@ export function registerSlackIngress(app: AppLike, opts: SlackIngressOptions): v
   }
 
   function enqueue(msg: IngressMessage) {
+    // Ack on ENQUEUE, not when the turn starts: a message queued behind a long-running turn
+    // otherwise sits with zero feedback for minutes and the agent looks hung. The matching
+    // removeReaction still fires when this message's own turn finishes.
+    addReaction(msg.channel, msg.ts, 'hourglass_flowing_sand', msg.useUserToken).catch(err => console.warn('[mcp-slack-use] addReaction failed:', err.message));
     const key = threadQueueKey(msg);
     const prev = threadQueues.get(key) || Promise.resolve();
     const next = prev.then(() => runTurn(msg)).catch(err => console.error('[mcp-slack-use] ingress turn error:', err));
     threadQueues.set(key, next);
   }
 
-  // ── One turn: hydrate reaction, stream, bookkeeping ────────────────────────
+  // ── One turn: stream, bookkeeping ──────────────────────────────────────────
   async function runTurn(msg: IngressMessage) {
-    await addReaction(msg.channel, msg.ts, 'hourglass_flowing_sand', msg.useUserToken).catch(err => console.warn('[mcp-slack-use] addReaction failed:', err.message));
     try {
       const iter = await opts.onMessage(msg);
       if (!iter) return;
       const replyTs = await pipeAgentReply(
-        { channel: msg.channel, threadTs: msg.threadTs, recipientUserId: msg.user, useUserToken: msg.useUserToken, transform, finalTransform: opts.finalTransform },
+        { channel: msg.channel, threadTs: msg.threadTs, recipientUserId: msg.user, useUserToken: msg.useUserToken, transform, finalTransform: opts.finalTransform, handle: msg },
         iter,
       );
       await opts.onReplied?.(msg, replyTs);

@@ -5,6 +5,24 @@
  */
 import { slackApi, requireToken, optionalUserToken } from './slack-api.ts';
 
+/** Slack's cumulative cap for all `markdown` blocks in one payload (docs.slack.dev, markdown block). */
+export const MARKDOWN_BLOCK_LIMIT = 12_000;
+
+/** Final-message payload: raw markdown in a `markdown` block (tables/headings render, as while streaming),
+ *  with the mrkdwn `text` as notification fallback. Over the cap → text-only (previous behaviour). */
+export function finalPayload(markdown: string, mrkdwn: string): { text: string; blocks?: unknown[] } {
+  if (!markdown.trim() || markdown.length > MARKDOWN_BLOCK_LIMIT) return { text: mrkdwn };
+  return { text: mrkdwn, blocks: [{ type: 'markdown', text: markdown }] };
+}
+
+/** Send a finalPayload; if Slack rejects it and blocks were attached, retry once text-only so the reply isn't lost. */
+async function sendFinal<T>(token: string, method: string, base: Record<string, unknown>, final: { text: string; blocks?: unknown[] }) {
+  const res = await slackApi<T>(token, method, { ...base, ...final });
+  if (res.ok || !final.blocks) return res;
+  console.error(`[slack-streamer] ${method} with markdown block failed (${(res as any).error}), retrying text-only`);
+  return slackApi<T>(token, method, { ...base, text: final.text });
+}
+
 let cachedAuthInfo: { teamId: string; botUserId: string } | null = null;
 
 async function getAuthInfo(token: string): Promise<{ teamId: string; botUserId: string }> {
@@ -48,6 +66,8 @@ export class SlackStreamer {
   private flushChain: Promise<void> = Promise.resolve();
   private afterTool = false;
   private toolMarkers: boolean;
+
+  private lastFinalizedTs: string | null = null;
 
   public ts: string | null = null;
   public readonly flat: boolean;
@@ -107,18 +127,46 @@ export class SlackStreamer {
       : this.fullText;
     const finalMrkdwn = this.transform(resolvedText);
 
-    if (!finalMrkdwn.trim()) return null;
+    if (!finalMrkdwn.trim()) return this.lastFinalizedTs;
+
+    const final = finalPayload(resolvedText, finalMrkdwn);
 
     if (this.flat) {
-      return this._postMessage(finalMrkdwn);
+      return this._postMessage(final);
     }
 
     if (this.startPromise) await this.startPromise;
 
     if (!this.ts) {
-      return this._postMessage(finalMrkdwn);
+      return this._postMessage(final);
     }
 
+    return this._finalizeCurrent(final);
+  }
+
+  /**
+   * Close the message in flight and start a fresh one for whatever follows. Call this before the
+   * host posts its OWN message mid-turn (e.g. an interactive question form): otherwise the rest of
+   * the reply keeps appending to the earlier message, i.e. ABOVE that form, which reads as the
+   * agent answering before it asked. No-op when nothing has been streamed yet.
+   */
+  async cut(): Promise<void> {
+    if (this.aborted || this.flat) return;
+    this._clearTimer();
+    if (this.startPromise) await this.startPromise;
+    if (!this.ts) return;
+    const text = this.finalTransform ? await this.finalTransform(this.fullText) : this.fullText;
+    await this._finalizeCurrent(finalPayload(text, this.transform(text)));
+    this.ts = null;
+    this.started = false;
+    this.startPromise = null;
+    this.buffer = '';
+    this.fullText = '';
+    this.afterTool = false;
+  }
+
+  /** stopStream + chat.update the in-flight message with its final text. Assumes this.ts is set. */
+  private async _finalizeCurrent(final: { text: string; blocks?: unknown[] }): Promise<string | null> {
     // Flush remaining buffer and wait for all sends to complete
     this._flushRemaining();
     await this.flushChain;
@@ -133,14 +181,11 @@ export class SlackStreamer {
     }
 
     // Then update the message with the final transformed text
-    const updateRes = await slackApi<{ ok: boolean }>(this.postToken, 'chat.update', {
-      channel: this.channel,
-      ts: this.ts,
-      text: finalMrkdwn,
-    });
+    const updateRes = await sendFinal<{ ok: boolean }>(this.postToken, 'chat.update', { channel: this.channel, ts: this.ts }, final);
     if (!updateRes.ok) {
       console.error('[slack-streamer] chat.update failed:', (updateRes as any).error);
     }
+    this.lastFinalizedTs = this.ts;
     return this.ts;
   }
 
@@ -236,10 +281,10 @@ export class SlackStreamer {
     if (!res.ok) console.error('[slack-streamer] tool marker failed:', (res as any).error);
   }
 
-  private async _postMessage(text: string): Promise<string | null> {
-    const payload: Record<string, unknown> = { channel: this.channel, text };
-    if (this.threadTs) payload.thread_ts = this.threadTs;
-    const res = await slackApi<{ ts?: string }>(this.postToken, 'chat.postMessage', payload);
+  private async _postMessage(final: { text: string; blocks?: unknown[] }): Promise<string | null> {
+    const base: Record<string, unknown> = { channel: this.channel };
+    if (this.threadTs) base.thread_ts = this.threadTs;
+    const res = await sendFinal<{ ts?: string }>(this.postToken, 'chat.postMessage', base, final);
     if (!res.ok) {
       console.error('[slack-streamer] postMessage fallback failed:', (res as any).error);
       return null;
