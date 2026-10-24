@@ -96,8 +96,11 @@ export function isTextFile(f: { mimetype: string; name?: string }): boolean {
 }
 
 export function isSupportedFile(f: SlackFile): boolean {
-  if (!SUPPORTED_FILE_MIMES.has(f.mimetype) && !isTextFile(f)) return false;
-  return f.size <= (isAudioFile(f) ? MAX_AUDIO_SIZE : MAX_FILE_SIZE);
+  if (!f.url_private || !f.mimetype) return false;
+  const maxSize = isAudioFile(f) ? MAX_AUDIO_SIZE : MAX_FILE_SIZE;
+  if (!Number.isFinite(f.size) || f.size <= 0 || f.size > maxSize) return false;
+  // Known types (image/pdf/audio/text) plus any other type under the size cap (zip, xlsx, …).
+  return true;
 }
 
 export async function downloadFileBuffer(url: string, botToken: string, userToken?: string, allowHtml?: boolean): Promise<Buffer> {
