@@ -5,6 +5,7 @@ import { RouterWrapper } from 'edge.libx.js/build/main.js';
 import { augmentMcpWithSkillResource } from './mcp/with-skill-resource.ts';
 import { requireToken, optionalUserToken, slackApi } from './slack-api.ts';
 import { buildPollBlocks, type PollSpec, type PollKind, type PollOption } from './poll-blocks.ts';
+import { renderCard, CARD_COMPONENTS } from './card-blocks.ts';
 import { slimChannels, slimHistory, slimSearch } from './slim.ts';
 import { inlineOrSpool } from './spool.ts';
 import { registerDmUserRoutes } from './routes-dm.ts';
@@ -219,6 +220,44 @@ export function createSlackMcp() {
       const data = await slackApi<{ channel?: string; ts?: string }>(token, 'chat.postMessage', payload);
       if (!data.ok) return json(data, { status: 400 });
       return json({ ok: true, pollId: spec.pollId, channel: data.channel ?? channel, ts: data.ts, kind: spec.kind, multi: spec.multi, targetUser: spec.targetUser, options: spec.options });
+    } catch (e) {
+      return json({ ok: false, error: errMessage(e) }, { status: 500 });
+    }
+  });
+
+  base.describeMCP('/slack/card', 'POST', {
+    description:
+      `Post a rich card (native Block Kit) to a Slack channel/DM/thread instead of a wall of text: tables, key-value fields, charts, images, buttons. Use when the answer is structured data or needs a click. Write a json-render spec using ONLY these components: ${CARD_COMPONENTS}. Buttons (not LinkButton) are clickable answers: the first click closes the card and you get notified with the choice, like a directed question. An invalid spec returns 400 with a readable error per issue — fix the spec and retry. channel is C/G/D id.`,
+    params: {
+      body: {
+        description:
+          '{ channel: string, spec: { root: string, elements: Record<id, { type, props, children: id[] }> }, thread_ts?: string, target_user?: string (U… id: only this user may click) }. Example spec: { root:"c", elements:{ c:{type:"Card",props:{title:"Signups"},children:["t","a"]}, t:{type:"Table",props:{headers:["Day","N"],rows:[["Mon","12"]]},children:[]}, a:{type:"Actions",props:{},children:["b"]}, b:{type:"Button",props:{id:"ok",label:"Approve",style:"primary"},children:[]} } }. Buttons must sit inside Actions.',
+        type: 'object',
+      },
+    },
+    annotations: { destructiveHint: false },
+  });
+  router.post('/slack/card', async (req) => {
+    try {
+      const token = requireToken();
+      const body = (await req.json()) as Record<string, unknown>;
+      const channel = body.channel;
+      if (typeof channel !== 'string' || !channel)
+        return json({ ok: false, error: 'channel is required' }, { status: 400 });
+      const cardId = crypto.randomUUID().slice(0, 8);
+      let card;
+      try { card = renderCard(body.spec, cardId); }
+      catch (e) { return json({ ok: false, error: `invalid spec: ${errMessage(e)}` }, { status: 400 }); }
+      const payload: Record<string, unknown> = { channel, text: card.text, blocks: card.blocks };
+      if (typeof body.thread_ts === 'string') payload.thread_ts = body.thread_ts;
+      const data = await slackApi<{ channel?: string; ts?: string }>(token, 'chat.postMessage', payload);
+      if (!data.ok) return json(data, { status: 400 });
+      const targetUser = typeof body.target_user === 'string' ? body.target_user : undefined;
+      return json({
+        ok: true, channel: data.channel ?? channel, ts: data.ts,
+        // Host contract (same as /slack/poll): register a directed question when the card has buttons.
+        ...(card.options.length ? { pollId: cardId, kind: 'question', title: card.text.split('\n')[0].replace(/\*/g, '').slice(0, 150), targetUser, options: card.options, blocks: card.blocks } : {}),
+      });
     } catch (e) {
       return json({ ok: false, error: errMessage(e) }, { status: 500 });
     }

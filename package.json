@@ -8,7 +8,11 @@
     "http": "bun run src/mcp/cli.ts --http"
   },
   "dependencies": {
-    "edge.libx.js": "^0.7.0"
+    "@chat-adapter/slack": "^4.43.0",
+    "@json-render/chat": "0.22.0",
+    "chat": "^4.43.0",
+    "edge.libx.js": "^0.7.0",
+    "zod": "^4"
   },
   "devDependencies": {
     "@types/bun": "latest",
