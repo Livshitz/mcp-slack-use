@@ -231,7 +231,7 @@ export function createSlackMcp() {
     params: {
       body: {
         description:
-          '{ channel: string, spec: { root: string, elements: Record<id, { type, props, children: id[] }> }, thread_ts?: string, target_user?: string (U… id: only this user may click) }. Example spec: { root:"c", elements:{ c:{type:"Card",props:{title:"Signups"},children:["t","a"]}, t:{type:"Table",props:{headers:["Day","N"],rows:[["Mon","12"]]},children:[]}, a:{type:"Actions",props:{},children:["b"]}, b:{type:"Button",props:{id:"ok",label:"Approve",style:"primary"},children:[]} } }. Buttons must sit inside Actions.',
+          '{ channel: string, spec: { root: string, elements: Record<id, { type, props, children: id[] }> }, thread_ts?: string, text?: string (notification/search text; default derived from the card), target_user?: string (U… id: only this user may click) }. Example spec: { root:"c", elements:{ c:{type:"Card",props:{title:"Signups"},children:["t","a"]}, t:{type:"Table",props:{headers:["Day","N"],rows:[["Mon","12"]]},children:[]}, a:{type:"Actions",props:{},children:["b"]}, b:{type:"Button",props:{id:"ok",label:"Approve",style:"primary"},children:[]} } }. Buttons must sit inside Actions.',
         type: 'object',
       },
     },
@@ -248,7 +248,9 @@ export function createSlackMcp() {
       let card;
       try { card = renderCard(body.spec, cardId); }
       catch (e) { return json({ ok: false, error: `invalid spec: ${errMessage(e)}` }, { status: 400 }); }
-      const payload: Record<string, unknown> = { channel, text: card.text, blocks: card.blocks };
+      // Notification + search text; a caller passes its own when it dedups by message text.
+      const text = typeof body.text === 'string' && body.text ? body.text : card.text;
+      const payload: Record<string, unknown> = { channel, text, blocks: card.blocks };
       if (typeof body.thread_ts === 'string') payload.thread_ts = body.thread_ts;
       const data = await slackApi<{ channel?: string; ts?: string }>(token, 'chat.postMessage', payload);
       if (!data.ok) return json(data, { status: 400 });
