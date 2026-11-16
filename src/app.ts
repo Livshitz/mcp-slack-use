@@ -563,6 +563,9 @@ export function createSlackMcp() {
       .catch(e => console.error('[mcp-slack] setPresence failed:', e));
     ping();
     presencePingTimer = setInterval(ping, 5 * 60 * 1000);
+    // unref: a keep-online ping must never keep a process alive by itself. A one-shot script that embeds
+    // createSlackMcp() and forgets mcp.close() otherwise never exits (Circles campaign-config-sync hung 31h).
+    presencePingTimer.unref?.();
   }
 
   Object.assign(mcp, {
